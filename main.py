@@ -81,6 +81,9 @@ async def parse_dtek():
 
 
 @app.get("/api/dtek-podilsk")
+@app.get("/")
+async def root():
+    return await get_schedule()
 async def get_schedule():
     now = time.time()
     if CACHE["data"] and (now - CACHE["timestamp"] < CACHE_TTL):
