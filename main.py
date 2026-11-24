@@ -1,8 +1,7 @@
 import time
-import traceback
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from playwright.async_api import async_playwright
 
 app = FastAPI()
 
@@ -17,88 +16,100 @@ CACHE = {"data": None, "timestamp": 0}
 CACHE_TTL = 300
 
 
-async def parse_dtek():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+async def fetch_dtek():
+    url = "https://www.dtek-oem.com.ua/ua/ajax"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.dtek-oem.com.ua/ua/shutdowns",
+    }
+    payload = {
+        "method": "getHomeNum",
+        "data[0][name]": "city",
+        "data[0][value]": "м. Подільськ",
+        "data[1][name]": "street",
+        "data[1][value]": "вул. Петра Дорошенка",
+        "data[2][name]": "updateFact",
+        "data[2][value]": time.strftime("%d.%m.%Y %H:%M"),
+    }
+
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        await client.get("https://www.dtek-oem.com.ua/ua/shutdowns", headers=headers)
+        resp = await client.post(url, data=payload, headers=headers)
+
+        if resp.status_code != 200:
+            return {
+                "status": "warn",
+                "title": "Сайт ДТЕК тимчасово недоступний",
+                "description": f"Код відповіді сервера ДТЕК: {resp.status_code}",
+                "group": "м. Подільськ",
+            }
 
         try:
-            await page.goto("https://www.dtek-oem.com.ua/ua/shutdowns", timeout=60000)
-            await page.wait_for_timeout(3000)
-
-            close_btn = page.locator(".modal__close, .btn-close").first
-            if await close_btn.is_visible():
-                await close_btn.click()
-
-            city_input = page.locator("#city")
-            await city_input.fill("м. Подільськ")
-            await page.wait_for_timeout(1500)
-            await page.locator("#cityautocomplete-list div").first.click()
-
-            street_input = page.locator("#street")
-            await street_input.fill("вул. Петра Дорошенка")
-            await page.wait_for_timeout(1500)
-            await page.locator("#streetautocomplete-list div").first.click()
-
-            house_input = page.locator("#house_num")
-            await house_input.fill("18")
-            await page.wait_for_timeout(1500)
-            await page.locator("#house_numautocomplete-list div").first.click()
-
-            await page.wait_for_timeout(3000)
-
-            result_block = page.locator("#showCurOutage")
-            raw_text = (await result_block.inner_text()).strip() if await result_block.is_visible() else ""
-
-            lower_text = raw_text.lower()
-            if not raw_text or "відключень не зафіксовано" in lower_text:
-                status = "on"
-                title = "Світло є"
-                description = raw_text or "За вказаною адресою наразі відключень не зафіксовано."
-            elif "стабілізаційне" in lower_text or "аварійне" in lower_text or "екстрене" in lower_text:
-                status = "off"
-                title = "Зафіксовано відключення"
-                description = raw_text
-            else:
-                status = "warn"
-                title = "Увага / Можливі зміни"
-                description = raw_text
-
+            data = resp.json()
+        except Exception:
             return {
-                "status": status,
-                "title": title,
-                "description": description,
-                "group": "м. Подільськ"
+                "status": "warn",
+                "title": "Потрібна перевірка захисту ДТЕК",
+                "description": "Сайт ДТЕК повернув сторінку перевірки замість JSON.",
+                "group": "м. Подільськ",
             }
-        finally:
-            await browser.close()
+
+        houses = data.get("data", {})
+        house_info = houses.get("18") if isinstance(houses, dict) else None
+
+        if not house_info:
+            return {
+                "status": "on",
+                "title": "Світло є",
+                "description": "За адресою м. Подільськ, вул. Петра Дорошенка, 18 наразі відключень не зафіксовано.",
+                "group": "м. Подільськ",
+            }
+
+        sub_type = str(house_info.get("sub_type", "")).strip()
+        start_date = str(house_info.get("start_date", "")).strip()
+        end_date = str(house_info.get("end_date", "")).strip()
+
+        if sub_type:
+            desc = f"Причина: {sub_type}."
+            if start_date or end_date:
+                desc += f" Час: {start_date} — {end_date}."
+            return {
+                "status": "off",
+                "title": "Зафіксовано відключення",
+                "description": desc,
+                "group": "м. Подільськ",
+            }
+
+        return {
+            "status": "on",
+            "title": "Світло є",
+            "description": "Активних відключень по будинку №18 не знайдено.",
+            "group": "м. Подільськ",
+        }
 
 
 @app.get("/api/dtek-podilsk")
-@app.get("/")
-async def root():
-    return await get_schedule()
 async def get_schedule():
     now = time.time()
     if CACHE["data"] and (now - CACHE["timestamp"] < CACHE_TTL):
         return CACHE["data"]
 
     try:
-        fresh_data = await parse_dtek()
+        fresh_data = await fetch_dtek()
         CACHE["data"] = fresh_data
         CACHE["timestamp"] = now
         return fresh_data
     except Exception as e:
         return {
             "status": "warn",
-            "title": "Помилка парсингу",
+            "title": "Помилка з'єднання з ДТЕК",
             "description": str(e),
-            "trace": traceback.format_exc().splitlines()[-3:],
-            "group": ""
+            "group": "м. Подільськ",
         }
+
+
+@app.get("/")
+async def root():
+    return await get_schedule()
+            
