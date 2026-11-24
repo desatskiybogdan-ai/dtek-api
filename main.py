@@ -1,3 +1,5 @@
+import asyncio
+import os
 import re
 import time
 import httpx
@@ -15,6 +17,19 @@ app.add_middleware(
 
 CACHE = {"data": None, "timestamp": 0}
 CACHE_TTL = 300
+LAST_STATUS = None
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+
+async def send_telegram(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, json={"chat_id": CHAT_ID, "text": text})
+        return r.status_code == 200
 
 
 async def fetch_dtek():
@@ -28,10 +43,7 @@ async def fetch_dtek():
 
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         init_resp = await client.get(base_url, headers=headers)
-        html = init_resp.text
-
-        # Ищем CSRF-токен в мета-тегах страницы ДТЕК
-        token_match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
+        token_match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', init_resp.text)
         csrf_token = token_match.group(1) if token_match else ""
 
         ajax_headers = {
@@ -55,12 +67,11 @@ async def fetch_dtek():
         }
 
         resp = await client.post(ajax_url, data=payload, headers=ajax_headers)
-
         if resp.status_code != 200:
             return {
                 "status": "warn",
                 "title": "Сайт ДТЕК відхилив запит",
-                "description": f"Код відповіді: {resp.status_code} (CSRF знайдено: {bool(csrf_token)})",
+                "description": f"Код відповіді: {resp.status_code}",
                 "group": "м. Подільськ",
             }
 
@@ -108,27 +119,55 @@ async def fetch_dtek():
         }
 
 
+async def check_and_notify():
+    global LAST_STATUS
+    fresh = await fetch_dtek()
+    CACHE["data"] = fresh
+    CACHE["timestamp"] = time.time()
+
+    current_status = fresh.get("status")
+    if LAST_STATUS is not None and current_status != LAST_STATUS:
+        emoji = "🟢" if current_status == "on" else ("🔴" if current_status == "off" else "🟡")
+        msg = (
+            f"{emoji} {fresh.get('title')}\n"
+            f"Адреса: м. Подільськ, вул. Петра Дорошенка, 18\n"
+            f"{fresh.get('description')}"
+        )
+        await send_telegram(msg)
+
+    LAST_STATUS = current_status
+    return fresh
+
+
+async def watcher_loop():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await check_and_notify()
+        except Exception:
+            pass
+        await asyncio.sleep(300)
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(watcher_loop())
+
+
 @app.get("/api/dtek-podilsk")
 async def get_schedule():
     now = time.time()
     if CACHE["data"] and (now - CACHE["timestamp"] < CACHE_TTL):
         return CACHE["data"]
+    return await check_and_notify()
 
-    try:
-        fresh_data = await fetch_dtek()
-        CACHE["data"] = fresh_data
-        CACHE["timestamp"] = now
-        return fresh_data
-    except Exception as e:
-        return {
-            "status": "warn",
-            "title": "Помилка з'єднання з ДТЕК",
-            "description": str(e),
-            "group": "м. Подільськ",
-        }
+
+@app.get("/api/test-telegram")
+async def test_telegram():
+    ok = await send_telegram("✅ Тест повідомлення: бот Подільськ (вул. Петра Дорошенка, 18) підключено.")
+    return {"sent": ok}
 
 
 @app.get("/")
 async def root():
     return await get_schedule()
-            
